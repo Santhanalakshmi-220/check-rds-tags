@@ -1,0 +1,299 @@
+"""
+Python script to check RDS IP violations and create issue in JIRA
+"""
+
+import os
+import json
+import sys
+from collections import defaultdict
+import boto3                                                                        # pylint: disable=E0401
+import requests
+from boto3.session import Session                                                   # pylint: disable=E0401
+from botocore.exceptions import ClientError, BotoCoreError                          # pylint: disable=E0401
+
+# Environment variables
+AWS_ACCOUNTS_CRED_FILE = os.environ["AWS_ACCOUNTS_CRED_FILE"]
+GITLAB_TOKEN = os.environ["GITLAB_TOKEN"]
+CI_SERVER_URL = os.environ["CI_SERVER_URL"]
+IGNORED_AWS_ACCOUNTS = os.environ.get("IGNORED_AWS_ACCOUNTS", "")
+JIRA_TOKEN = os.environ["JIRA_TOKEN"]
+EMAIL = os.environ["SCHEDULED_ISSUE_ASSIGNEE"]
+BOARD_ID = 35
+PROJECT_ID = 10017
+COMPONENT = "Infra"
+ISSUE_LABEL = "RDS Compliance Check"
+STORY_POINT = 4
+SUMMARY = "RDS IP Restriction Violation Detected"
+
+def load_aws_accounts():                                                        # pylint: disable=C0116
+    try:
+        with open(AWS_ACCOUNTS_CRED_FILE, "r", encoding="utf-8") as f:
+            raw_data = f.read().strip()
+            if raw_data.startswith("AWS_ACCOUNTS = "):
+                raw_data = raw_data.split("=", 1)[1]
+            return json.loads(raw_data)
+    except Exception as ex:                                                     # pylint: disable=W0718,W0621
+        print(f"Error loading AWS accounts: {ex}")
+        sys.exit(1)
+
+
+def get_open_security_groups(ec2_client, sg_ids):                                # pylint: disable=C0116
+    open_sg_ids = set()
+    try:
+        sgs = ec2_client.describe_security_groups(GroupIds=sg_ids)["SecurityGroups"]
+        for sg in sgs:
+            for perm in sg.get("IpPermissions", []):
+                for rg in perm.get("IpRanges", []):
+                    if rg.get("CidrIp") == "0.0.0.0/0":
+                        open_sg_ids.add(sg["GroupId"])
+                for rg in perm.get("Ipv6Ranges", []):
+                    if rg.get("CidrIpv6") == "::/0":
+                        open_sg_ids.add(sg["GroupId"])
+    except Exception:                                                           # pylint: disable=W0718
+        pass
+    return open_sg_ids
+
+
+def check_public_rds(accounts, ignored_accounts, allowed_regions=None, exclude_regions=None):       # pylint: disable=C0116,R0914
+    violations = []
+
+    service_regions = set(Session().get_available_regions("rds"))
+    default_excludes = {"cn-north-1", "cn-northwest-1", "us-gov-east-1", "us-gov-west-1"}
+
+    if exclude_regions:
+        default_excludes.update(exclude_regions)
+
+    regions_to_scan = set(map(str, allowed_regions)) & service_regions if allowed_regions else service_regions # pylint: disable=C0301
+    regions_to_scan -= default_excludes
+    regions_to_scan = sorted(regions_to_scan)
+
+    for account in accounts:                                                            # pylint: disable=R1702
+        acct_id = str(account["account_id"])
+        if acct_id in set(map(str, ignored_accounts or [])):
+            continue
+
+        name = account.get("name", acct_id)
+        ak = account["aws_access_key_id"]
+        sk = account["aws_secret_access_key"]
+        token = account.get("aws_session_token")
+
+        print(f"\n\033[1;34mChecking account: {name} ({acct_id})…\033[0m")
+
+        try:
+            boto3.client("sts", aws_access_key_id=ak, aws_secret_access_key=sk, aws_session_token=token)         # pylint: disable=C0301
+        except Exception:                                                               # pylint: disable=W0718
+            continue
+
+        for region in regions_to_scan:
+            rds = boto3.client("rds", aws_access_key_id=ak, aws_secret_access_key=sk,
+                               aws_session_token=token, region_name=region)
+            ec2 = boto3.client("ec2", aws_access_key_id=ak, aws_secret_access_key=sk,
+                               aws_session_token=token, region_name=region)
+
+            try:
+                paginator = rds.get_paginator("describe_db_instances")
+                for page in paginator.paginate():
+                    for db in page.get("DBInstances", []):
+                        db_id = db.get("DBInstanceIdentifier", "<unknown>")
+                        if not db.get("PubliclyAccessible", False):
+                            continue
+
+                        sg_ids = [sg.get("VpcSecurityGroupId")
+                                  for sg in db.get("VpcSecurityGroups", []) if sg.get("VpcSecurityGroupId")]          # pylint: disable=C0301
+                        if not sg_ids:
+                            continue
+
+                        open_sg_ids = get_open_security_groups(ec2, sg_ids)
+
+                        if open_sg_ids:
+                            violations.append({
+                                "account": acct_id,
+                                "region": region,
+                                "db_instance": db_id,
+                                "open_sg_ids": sorted(open_sg_ids)
+                            })
+            except (ClientError, BotoCoreError):
+                continue
+
+    return violations
+
+
+def convert_to_adf(ip_violated_ports):                                              # pylint: disable=C0116
+    adf_doc = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {
+                "type": "paragraph",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "The following Amazon RDS instances are publicly accessible and have security groups "          # pylint: disable=C0301
+                            "open to 0.0.0.0/0, which violates IP restriction policies.\n\n"
+                            "Instances with Open Security Groups:"
+                        )
+                    }
+                ]
+            },
+            {
+                "type": "table",
+                "attrs": {"isNumberColumnEnabled": False, "layout": "align-start"},
+                "content": []
+            }
+        ]
+    }
+
+    headers = ["account", "region", "db_instance", "open_security_groups"]
+    adf_doc["content"][1]["content"].append({
+        "type": "tableRow",
+        "content": [
+            {
+                "type": "tableHeader",
+                "attrs": {},
+                "content": [{
+                    "type": "paragraph",
+                    "content": [{"type": "text", "text": h, "marks": [{"type": "strong"}]}]
+                }]
+            } for h in headers
+        ]
+    })
+
+    grouped = defaultdict(lambda: {"open_security_groups": set()})
+    for row in ip_violated_ports:
+        key = (row["account"], row["region"], row["db_instance"])
+        grouped[key]["open_security_groups"].update(row.get("open_sg_ids", []))
+
+    for (account, region, db_instance), data in grouped.items():
+        row_data = [account, region, db_instance, ",".join(sorted(data["open_security_groups"]))]
+        row = {"type": "tableRow", "content": []}
+        for cell in row_data:
+            row["content"].append({
+                "type": "tableCell",
+                "attrs": {},
+                "content": [{"type": "paragraph", "content": [{"type": "text", "text": cell}]}]
+            })
+        adf_doc["content"][1]["content"].append(row)
+
+    return adf_doc
+
+
+def get_jira_user_id():                                                             # pylint: disable=C0116
+    try:
+        url = f'https://mitsogo.atlassian.net/rest/api/3/user/search?query={EMAIL}'
+        headers = {'Accept': 'application/json'}
+        response = requests.get(url, auth=(JIRA_TOKEN, ''), headers=headers, timeout=60)
+        response.raise_for_status()
+        return response.json()[0]['accountId']
+    except Exception as ex:                                                                  # pylint: disable=W0718,W0621
+        print(f"Error retrieving Jira user ID: {ex}")
+        sys.exit(1)
+
+
+def get_current_sprint_id():                                                                 # pylint: disable=C0116
+    try:
+        url = f'https://mitsogo.atlassian.net/rest/agile/1.0/board/{BOARD_ID}/sprint?state=active'
+        headers = {'Accept': 'application/json'}
+        response = requests.get(url, auth=(JIRA_TOKEN, ''), headers=headers, timeout=60)
+        response.raise_for_status()
+        return response.json()['values'][0]['id']
+    except Exception as ex:                                                                   # pylint: disable=W0621,W0718
+        print(f"Error fetching current sprint ID: {ex}")
+        sys.exit(1)
+
+
+def find_existing_issue():                                                                    # pylint: disable=C0116
+    search_url = 'https://mitsogo.atlassian.net/rest/api/3/search/jql'
+    search_payload = {
+        "fields": ["description"],
+        "jql": ('project = "DEVOPS" AND summary ~ "{}" AND labels = scheduled-job '           # pylint: disable=C0209
+                'AND statuscategory IN (new, indeterminate)').format(SUMMARY)
+    }
+    headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
+    try:
+        response = requests.post(search_url, auth=(JIRA_TOKEN, ''),
+                                 headers=headers, data=json.dumps(search_payload), timeout=60)
+        response.raise_for_status()
+        issues = response.json().get('issues', [])
+        if not issues:
+            return None, None
+
+        description = issues[0]['fields'].get('description', {})
+        try:
+            description_text = description['content'][0]['content'][0]['text']
+        except (KeyError, IndexError):
+            description_text = ""
+        return issues[0]['id'], description_text
+    except Exception as ex:                                                     # pylint: disable=W0718,W0621
+        print(f"Error finding existing Jira issue: {ex}")
+        return None, None
+
+
+def create_or_update_issue(adf_doc, user_id, sprint_id):                        # pylint: disable=W0621,C0116
+    issue_id, existing_description = find_existing_issue()
+    try:
+        if issue_id:
+            if adf_doc == existing_description:
+                print("\033[0;34m------------ Issue already exists ------------\033[0m")
+                return
+
+            print("\033[0;34m------------ Issue exists, updating description ------------\033[0m")
+            url = f'https://mitsogo.atlassian.net/rest/api/3/issue/{issue_id}'
+            payload = {"fields": {"description": adf_doc}, "update": {}}
+            response = requests.put(url, auth=(JIRA_TOKEN, ''),
+                                     headers={'Accept': 'application/json',
+                                              'Content-Type': 'application/json'},
+                                     data=json.dumps(payload), timeout=60)
+        else:
+            print("\033[0;34m---------- Issue does not exist, creating new issue ----------\033[0m")
+            url = 'https://mitsogo.atlassian.net/rest/api/3/issue'
+            payload = {
+                "fields": {
+                    "assignee": {"id": user_id},
+                    "components": [{"name": COMPONENT}],
+                    "customfield_10020": sprint_id,
+                    "customfield_10060": STORY_POINT,
+                    "summary": SUMMARY,
+                    "description": adf_doc,
+                    "issuetype": {"id": "10016"},
+                    "labels": ["scheduled-job", "rds-compliance-check"],
+                    "priority": {"id": "2"},
+                    "project": {"id": PROJECT_ID}
+                },
+                "update": {}
+            }
+            response = requests.post(url, auth=(JIRA_TOKEN, ''),
+                                     headers={'Accept': 'application/json',
+                                              'Content-Type': 'application/json'},
+                                     data=json.dumps(payload), timeout=60)
+
+        if response.status_code not in [201, 204]:
+            print(f"ERROR: Something went wrong! Status code: {response.status_code}")
+            print(response.text)
+            sys.exit(1)
+        else:
+            print("\033[0;34m------------ Issue created/updated successfully! ------------\033[0m")
+    except Exception as ex:                                                         # pylint: disable=W0621,W0718
+        print(f"Failed to create or update Jira issue: {ex}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    try:
+        aws_accounts = load_aws_accounts()
+        ignored_accounts = set(IGNORED_AWS_ACCOUNTS.split(","))
+        print("\033[1;34mRunning public-RDS security-group check across all accounts…")
+        rds_violations = check_public_rds(aws_accounts, ignored_accounts)
+
+        if not rds_violations:
+            print("\033[1;34mNo publicly accessible RDS instances with wide-open SGs found.")
+            sys.exit(0)
+
+        print("\033[1;34mFound publicly accessible RDS instances with open security groups:")
+        adf_description = convert_to_adf(rds_violations)
+        user_id = get_jira_user_id()
+        sprint_id = get_current_sprint_id()
+        create_or_update_issue(adf_description, user_id, sprint_id)
+    except Exception as ex:                                                     # pylint: disable=W0718
+        print(f"Unexpected error: {ex}")
+        sys.exit(1)                                                             # pylint: disable=C0304
