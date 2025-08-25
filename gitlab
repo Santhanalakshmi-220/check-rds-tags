@@ -1,0 +1,157 @@
+spec:
+  inputs:
+    SCHEDULE_TYPE:
+      type: string
+      description: Scheduled type of the job to be run
+      default: variable-check
+      options:
+        - variable-check
+        - mandatory-job-check
+        - bot-user-check
+        - guardduty
+        - ip_restriction_check
+        - rds_ip_restriction_check
+        - ec2-compliance-check
+
+---
+stages:
+  - code_quality
+  - schedule
+  - Ip Restriction Check
+
+variables:
+  SCHEDULE_TYPE: $[[ inputs.SCHEDULE_TYPE ]]
+  
+
+code_quality:
+  stage: code_quality
+  image: gitlab.mitsogo.com:4567/devops/docker-images/pylinter
+  before_script:
+    - pip3 install -r requirements.txt
+  script:
+    - python3 -m pylint --recursive=y --disable=R0801 .
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+      changes:
+          - "**/*.py"
+  tags:
+    - docker
+
+MandatoryJobCheck:
+  stage: schedule
+  image: python:alpine
+  variables:
+    PROJECTS_TO_SKIP: $PROJECTS_TO_SKIP
+    GROUPS_TO_SKIP: $GROUPS_TO_SKIP
+  before_script:
+    - pip install requests markdown ruamel.yaml
+  script:
+    - python utility/mandatory_jobs.py
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_TYPE == "mandatory-job-check"
+  tags:
+    - docker
+
+bot-user-check:
+  stage: schedule
+  image: python:alpine
+  before_script:
+    - pip install requests markdown ruamel.yaml pyyaml
+  script:
+    - python utility/bot_user_check.py
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_TYPE == "bot-user-check"
+  tags:
+    - docker
+
+guardduty-alert-check:
+  stage: schedule
+  image: python:3.10-alpine
+  before_script:
+    - pip install -q boto3 requests
+    - mv $AWS_ACCOUNTS_CRED utility/aws_variables.py
+  script:
+    - python utility/guardduty_alert_check.py
+  tags:
+    - docker
+  rules:
+    - if: $CI_COMMIT_BRANCH == "scheduler" && $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_TYPE == "guardduty"
+
+sensitive-variable-check:
+  stage: schedule
+  image: python:alpine
+  before_script:
+    - pip install requests markdown ruamel.yaml pyyaml
+  script:
+    - python utility/sensitive_variable_check.py
+  rules:
+    - if: $CI_COMMIT_BRANCH == "scheduler" && $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_TYPE == "variable-check"
+  tags:
+    - docker
+
+ip_restriction_check:
+  stage: schedule
+  image: python:3
+  variables:
+    AWS_ACCOUNTS_CRED_FILE: "$AWS_ACCOUNTS_CRED"
+    GITLAB_TOKEN: "$GITLAB_TOKEN"
+    JIRA_TOKEN: "$JIRA_TOKEN"
+    SCHEDULED_ISSUE_ASSIGNEE: "$SCHEDULED_ISSUE_ASSIGNEE"
+    CI_SERVER_URL: "$CI_SERVER_URL"
+  before_script:
+    - apt-get update && apt-get install -y curl
+    - pip install boto3 requests PyYAML
+  script:
+    - |
+        curl -gso ip_restriction_check.py -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$CI_SERVER_URL/api/v4/projects/956/repository/files/utility%2Fip%5Frestriction%5Fcheck%2Epy/raw?ref=scheduler"
+    - python ip_restriction_check.py
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_TYPE == "ip_restriction_check"
+  tags:
+    - docker
+
+ip-restriction-check-rds:
+  stage: schedule
+  image: python:3
+  variables:
+    AWS_ACCOUNTS_CRED_FILE:    "$AWS_ACCOUNTS_CRED"
+    GITLAB_TOKEN:               "$GITLAB_TOKEN"
+    JIRA_TOKEN:                 "$JIRA_TOKEN"
+    SCHEDULED_ISSUE_ASSIGNEE:   "$SCHEDULED_ISSUE_ASSIGNEE"
+    CI_SERVER_URL:              "$CI_SERVER_URL"
+  before_script:
+    - apt-get update && apt-get install -y curl
+    - pip install boto3 requests PyYAML
+  script:
+    - |
+      curl -gso utility/rds_ip_restriction_check.py \
+        -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+        "$CI_SERVER_URL/api/v4/projects/956/repository/files/utility%2Frds_ip_restriction_check%2Epy/raw?ref=scheduler"
+    - python utility/rds_ip_restriction_check.py
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_TYPE == "ip-restriction-check-rds"
+  tags:
+    - docker
+
+ec2-compliance-check:
+  stage: schedule
+  image: python:3
+  variables:
+    AWS_ACCOUNTS_CRED_FILE:    "$AWS_ACCOUNTS_CRED"
+    GITLAB_TOKEN:              "$GITLAB_TOKEN"
+    JIRA_TOKEN:                "$JIRA_TOKEN"
+    SCHEDULED_ISSUE_ASSIGNEE:  "$SCHEDULED_ISSUE_ASSIGNEE"
+    CI_SERVER_URL:             "$CI_SERVER_URL"
+  before_script:
+    - apt-get update && apt-get install -y curl
+    - pip install boto3 requests PyYAML
+  script:
+    - |
+      curl -gso utility/ec2_ip_restriction_check.py \
+        -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+        "$CI_SERVER_URL/api/v4/projects/956/repository/files/utility%2Fec2_ip_restriction_check%2Epy/raw?ref=scheduler"
+    - python utility/ec2_ip_restriction_check.py
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_TYPE == "ec2-compliance-check"
+  tags:
+    - docker
