@@ -23,7 +23,7 @@ PROJECT_ID = 10017
 COMPONENT = "Infra"
 ISSUE_LABEL = "RDS Compliance Check"
 STORY_POINT = 4
-SUMMARY = "RDS IP Restriction Violation Detected"
+SUMMARY = "RDS IP Restriction and Tag Compliance Issues"
 
 def load_aws_accounts():                                                        # pylint: disable=C0116
     try:
@@ -143,70 +143,6 @@ def check_public_rds(accounts, ignored_accounts, allowed_regions=None, exclude_r
 
     return violations, tag_violations
 
-def list_all_rds_instances_with_tags(accounts, ignored_accounts, allowed_regions=None, exclude_regions=None):  # pylint: disable=C0116,R0914
-    service_regions = set(Session().get_available_regions("rds"))
-    default_excludes = {"cn-north-1", "cn-northwest-1", "us-gov-east-1", "us-gov-west-1"}
-
-    if exclude_regions:
-        default_excludes.update(exclude_regions)
-
-    regions_to_scan = set(map(str, allowed_regions)) & service_regions if allowed_regions else service_regions
-    regions_to_scan -= default_excludes
-    regions_to_scan = sorted(regions_to_scan)
-
-    for account in accounts:
-        acct_id = str(account["account_id"])
-        if acct_id in set(map(str, ignored_accounts or [])):
-            continue
-
-        name = account.get("name", acct_id)
-        ak = account["aws_access_key_id"]
-        sk = account["aws_secret_access_key"]
-        token = account.get("aws_session_token")
-
-        print(f"\n\033[1;34mScanning account: {name} ({acct_id})\033[0m")
-
-        try:
-            boto3.client("sts", aws_access_key_id=ak, aws_secret_access_key=sk, aws_session_token=token)
-        except Exception:
-            print(f"  Skipping account {acct_id} due to invalid credentials.")
-            continue
-
-        for region in regions_to_scan:
-            rds = boto3.client("rds", aws_access_key_id=ak, aws_secret_access_key=sk,
-                               aws_session_token=token, region_name=region)
-
-            try:
-                paginator = rds.get_paginator("describe_db_instances")
-                for page in paginator.paginate():
-                    for db in page.get("DBInstances", []):
-                        db_id = db.get("DBInstanceIdentifier", "<unknown>")
-                        engine = db.get("Engine", "<unknown>")
-                        public = db.get("PubliclyAccessible", False)
-                        arn = db.get("DBInstanceArn")
-
-                        print(f"\n🔹 Account: {acct_id}, Region: {region}")
-                        print(f"   DB Identifier: {db_id}")
-                        print(f"   Engine: {engine}")
-                        print(f"   Publicly Accessible: {public}")
-
-                        # Fetch and print tags
-                        try:
-                            tag_response = rds.list_tags_for_resource(ResourceName=arn)
-                            tags = {tag["Key"]: tag["Value"] for tag in tag_response.get("TagList", [])}
-                            if tags:
-                                print("   Tags:")
-                                for k, v in tags.items():
-                                    print(f"     - {k}: {v}")
-                            else:
-                                print("   Tags: None")
-                        except (ClientError, BotoCoreError):
-                            print("    Failed to retrieve tags.")
-
-            except (ClientError, BotoCoreError):
-                print(f"   Failed to scan region {region} in account {acct_id}.")
-                continue
-
 
 def convert_to_adf(ip_violated_ports, tag_violations):  # pylint: disable=C0116
     adf_doc = {
@@ -323,6 +259,7 @@ def convert_to_adf(ip_violated_ports, tag_violations):  # pylint: disable=C0116
 
     return adf_doc
 
+
 def get_jira_user_id():                                                             # pylint: disable=C0116
     try:
         url = f'https://mitsogo.atlassian.net/rest/api/3/user/search?query={EMAIL}'
@@ -427,25 +364,21 @@ if __name__ == "__main__":
     try:
         aws_accounts = load_aws_accounts()
         ignored_accounts = set(IGNORED_AWS_ACCOUNTS.split(","))
-        print("Ignored AWS accounts:", ignored_accounts)
         print("\033[1;34mRunning public-RDS security-group check across all accounts…")
         rds_violations, tag_violations = check_public_rds(aws_accounts, ignored_accounts)
-        list_all_rds_instances_with_tags(aws_accounts, ignored_accounts)
 
         if not rds_violations:
             print("\033[1;34mNo publicly accessible RDS instances with wide-open SGs found.")
-           #sys.exit(0)
+            #sys.exit(0)
         else:
             print("\033[1;34mFound publicly accessible RDS instances with open security groups:")
-        #adf_description = convert_to_adf(rds_violations, tag_violations)
-        #user_id = get_jira_user_id()
-        #sprint_id = get_current_sprint_id()
-        #create_or_update_issue(adf_description, user_id, sprint_id)
+
         if not tag_violations:
             print("\033[1;32m All RDS instances have valid tags.\033[0m")
             sys.exit(0)
 
         print("\033[1;31m Found RDS instances with missing or invalid tags:\033[0m")
+
         for violation in tag_violations:
             acct = violation["account"]
             region = violation["region"]
@@ -455,6 +388,11 @@ if __name__ == "__main__":
             print(f" Account: {acct}, Region: {region}, DB: {db}")
             print(f"   Missing Tags: {missing}")
             print(f"   Invalid Environment: {invalid_env}\n")
+        adf_description = convert_to_adf(rds_violations, tag_violations)
+        user_id = get_jira_user_id()
+        sprint_id = get_current_sprint_id()
+        create_or_update_issue(adf_description, user_id, sprint_id)
+
     except Exception as ex:                                                     # pylint: disable=W0718
         print(f"Unexpected error: {ex}")
         sys.exit(1)                                                             # pylint: disable=C0304
